@@ -51,7 +51,6 @@ __FBSDID("$FreeBSD: $");
 #include <sys/socket.h>
 #include <sys/sockio.h>
 #include <sys/sysctl.h>
-#include <sys/taskqueue.h>
 
 #include <net/if.h>
 #include <net/if_media.h>
@@ -101,14 +100,10 @@ MALLOC_DECLARE(M_SUME);
 MALLOC_DEFINE(M_SUME, "sume", "NetFPGA SUME nic_v2 device driver");
 
 static int sume_uam_rx_refill(struct nf_uam_priv *);
-static void sume_start_locked(struct ifnet *);
+static int sume_uam_rx_clean(struct nf_uam_priv *);
+static void sume_uam_tx_clean(struct nf_uam_priv *);
+static void sume_if_start_locked(struct ifnet *);
 static void sume_uam_down(struct sume_adapter *, struct ifnet *);
-static int sume_allocate_msix(struct nf_uam_priv *);
-static void sume_free_tx_buffers(struct tx_ring *);
-static void sume_free_rx_buffers(struct rx_ring *);
-static void sume_txeof(struct tx_ring *);
-static void sume_free_msix(struct nf_uam_priv *);
-static void sume_free_spare(struct nf_uam_priv *);
 
 static struct unrhdr *unr;
 
@@ -170,119 +165,94 @@ sume_probe(device_t dev)
 }
 
 static void
-sume_rxeof(struct rx_ring *rxr, int count)
+sume_uam_intr_handler_tx(void *arg)
 {
-	struct nf_uam_priv *nf_priv = rxr->nf_priv;
-	struct ifnet *ifp = nf_priv->ifp;
-	struct sume_adapter *adapter = nf_priv->adapter;
-	struct dma_engine *rx_engine= adapter->dma->dma_engine + DMA_ENG_RX;
-	struct dma_descriptor *rx_desc;
-	struct desc_info *rxbuf;
+	//printf("TX interrrupt.\n");
+	struct sume_adapter *adapter = arg;
+
+        adapter->dma->dma_common_block.irq_enable = 1;
+}
+
+static void
+sume_uam_intr_handler(void *arg)
+{
+	//printf("Got interrupt!\n");
+	struct sume_adapter *adapter = arg;
+	struct dma_engine *rx_engine;
+	rx_engine = adapter->dma->dma_engine + DMA_ENG_RX;
+	struct dma_descriptor *desc;
+        struct desc_info *info;
+        int n;
+	int budget = NUM_DESCRIPTORS - 1;
+	budget = adapter->rx_budget;
+	struct ifnet *ifp = adapter->ifp[0];
+	struct nf_uam_priv *nf_priv = ifp->if_softc;
 	struct mbuf *m;
-	struct nf_metadata *mdata;
-	int rxdone = 0;
 	uint64_t readlen;
 
-	SUME_RX_LOCK(rxr);
-	while (nf_priv->rx_ntc != rx_engine->head && count != 0) {
-		//if (!(ifp->if_flags & IFF_UP))
-			//break;
+	for (n = 0; (nf_priv->rx_ntc != rx_engine->head) && (n < budget); n++) {
+		desc = rx_engine->dma_descriptor + nf_priv->rx_ntc;
+		info = nf_priv->rx_desc_info + nf_priv->rx_ntc;
 
-		//printf("got desc = %d\n", nf_priv->rx_ntc);
-		rx_desc = &rxr->rx_base[nf_priv->rx_ntc];
-		rxbuf = &rxr->rx_buffers[nf_priv->rx_ntc];
-		//printf("RX %d\n", rxbuf->rb);
+		memcpy(&readlen, &desc->size, 8);
 
-                //rx_desc->generate_irq = 0;
-		readlen = rx_desc->size;
 		readlen -= SUME_METADATA_LEN; /* Subtract metadata length. */
 
-		//printf("got readlen = %lu\n", readlen);
-		//bus_dmamap_sync(rxr->rxtag, rxbuf->map,
-		    //BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
-		//bus_dmamap_unload(rxr->rxtag, rxbuf->map);
+		if (info->buf == NULL)
+			continue;
 
-		m = (struct mbuf *) rxbuf->buf;
+		m = (struct mbuf *) info->buf;
+		info->buf = NULL;
 
-		--count;
-		mdata = mtod(m, struct nf_metadata *);
+		struct nf_metadata *mdata = mtod(m, struct nf_metadata *);
 		if (le16toh(mdata->magic) != 0xCAFE) {
-			printf("no cafe %d\n", rxbuf->rb);
+			//printf ("no cafe %d\n", info->rb);
 			m_freem(m);
 			goto skip;
 		}
 
 		if (le16toh(mdata->plen) != readlen + sizeof(struct nf_metadata)) {
-			printf("wrong size %d\n", rxbuf->rb);
-			//printf("mdata->plen = %d\n", mdata->plen);
-			//printf("readlen + 16 = %lu\n", readlen + 16);
+			//printf ("wrong size %d\n", info->rb);
+			//printf ("le16toh(mdata->plen) %d\n", le16toh(mdata->plen));
+			//printf ("readlen + 16 %lu\n", readlen + sizeof(struct nf_metadata));
 			m_free(m);
 			goto skip;
 		}
-		
+
 		m->m_pkthdr.rcvif = ifp;
 		m_adj(m, sizeof(struct nf_metadata));
 		m->m_len = m->m_pkthdr.len = readlen;
 
-		SUME_RX_UNLOCK(rxr);
 		(*ifp->if_input)(ifp, m);
-		//m_freem(m);
-		SUME_RX_LOCK(rxr);
 
 skip:
-		rxbuf->buf = NULL;
-		++rxdone;
-		rxr->rx_avail--;
 		nf_priv->rx_ntc = RING_NEXT_IDX(nf_priv->rx_ntc);
-		if (count < 768) {
-			sume_uam_rx_refill(nf_priv);
-			write_reg(adapter, TAIL_RX_OFFSET, nf_priv->rx_ntc);
-		}
+		sume_uam_rx_refill(nf_priv);
 	}
 
-	if (rxdone) {
-		if (rxr->rx_avail < 769)
-			sume_uam_rx_refill(nf_priv);
-		write_reg(adapter, TAIL_RX_OFFSET, nf_priv->rx_ntc);
+	if (n) {
+		int tmp = nf_priv->rx_ntc - nf_priv->rx_ntu;
+		if (tmp < 0)
+			tmp += NUM_DESCRIPTORS;
+
+		adapter->rx_budget = NUM_DESCRIPTORS - tmp - 1;
+		//printf("End with budget: %d\n", adapter->rx_budget);
 	}
 
-	SUME_RX_UNLOCK(rxr);
+	write_reg(adapter, TAIL_RX_OFFSET, nf_priv->rx_ntu);
+
+        adapter->dma->dma_common_block.irq_enable = 1;
 }
 
-#if 0
-static void
-sume_msix_tx(void *arg)
+static int
+sume_intr_filter(void *arg)
 {
-	//return;
-	struct tx_ring *txr = arg;
-	//printf("TX interrrupt %lu.\n", txr->tx_irq + 1);
-	//struct sume_adapter *adapter = txr->adapter;
-	//struct nf_uam_priv *nf_priv = txr->nf_priv;
-	//struct ifnet *ifp = nf_priv->ifp;
+	//printf("Got filter\n");
+	struct sume_adapter *adapter = arg;
 
-	++txr->tx_irq;
-	SUME_TX_LOCK(txr);
-	sume_txeof(txr);
+        adapter->dma->dma_common_block.irq_enable = 0;
 
-	//sume_start_locked(ifp);
-
-	SUME_TX_UNLOCK(txr);
-}
-#endif
-
-static void
-sume_msix_rx(void *arg)
-{
-	struct rx_ring *rxr = arg;
-	//printf("RX interrrupt %lu.\n", rxr->rx_irq + 1);
-	struct sume_adapter *adapter = rxr->adapter;
-	struct nf_uam_priv *nf_priv = rxr->nf_priv;
-	struct ifnet *ifp = nf_priv->ifp;
-
-	++rxr->rx_irq;
-	if (!(ifp->if_drv_flags & IFF_DRV_RUNNING))
-		return;
-	sume_rxeof(rxr, adapter->rx_process_limit);
+	return (FILTER_SCHEDULE_THREAD);
 }
 
 static void
@@ -290,10 +260,7 @@ sume_free_ifp(struct sume_adapter *adapter)
 {
 	struct nf_uam_priv *nf_priv;
 	struct ifnet *ifp;
-	struct tx_ring *txr;
-	struct rx_ring *rxr;
 	int i;
-	int rid;
 
 	for (i = 0; i < SUME_NPORTS; i++) {
 		ifp = adapter->ifp[i];
@@ -312,42 +279,18 @@ sume_free_ifp(struct sume_adapter *adapter)
 			free_unr(unr, nf_priv->unit);
 		}
 
-		sume_free_msix(nf_priv);
-
 		ifp->if_flags &= ~IFF_UP;
 		ether_ifdetach(ifp);
 
-		rxr = nf_priv->rxr;
-		txr = nf_priv->txr;
+		sume_uam_tx_clean(nf_priv);
 
-		sume_free_tx_buffers(txr);
-		sume_free_rx_buffers(rxr);
-
-		if (rxr != NULL) {
-			rid = rxr->msix + 1;
-			if (mtx_initialized(&rxr->rx_mtx))
-				mtx_destroy(&rxr->rx_mtx);
-			if (rxr->rx_buffers)
-				free(rxr->rx_buffers, M_SUME);
-			free(rxr, M_SUME);
+		if (i == 0) {
+			sume_uam_rx_clean(nf_priv);
 		}
-
-		if (txr != NULL) {
-			rid = txr->msix + 1;
-			if (mtx_initialized(&txr->tx_mtx))
-				mtx_destroy(&txr->tx_mtx);
-			if (txr->tx_buffers)
-				free(txr->tx_buffers, M_SUME);
-			if (txr)
-				free(txr, M_SUME);
-		}
-
-		sume_free_spare(nf_priv);
 
 		if (nf_priv != NULL)
 			free(nf_priv, M_SUME);
 	}
-
 }
 
 /* If there is no sume_if_init, the ether_ioctl panics. */
@@ -359,103 +302,78 @@ sume_if_init(void *sc)
 static void
 callback_dma(void *arg, bus_dma_segment_t *segs, int nseg, int err)
 {
-	if (err)
+	if (err) {
+		printf("DMA error\n");
 		return;
+	}
 
 	KASSERT(nseg == 1, ("%s: %d segments returned!", __func__, nseg));
 
 	*(bus_addr_t *) arg = segs[0].ds_addr;
 }
 
+#if 1
 static void
 sume_if_start(struct ifnet *ifp)
 {
 	struct nf_uam_priv *nf_priv = ifp->if_softc;
-	struct tx_ring *txr = nf_priv->txr;
+	struct sume_adapter *adapter = nf_priv->adapter;
 
 	if (!(ifp->if_flags & IFF_UP))
 		return;
 
-	SUME_TX_LOCK(txr);
-	sume_start_locked(ifp);
-	SUME_TX_UNLOCK(txr);
+	SUME_LOCK(adapter);
+	sume_if_start_locked(ifp);
+	SUME_UNLOCK(adapter);
 }
+#endif
 
+/*
+ * Packet to transmit. We take the packet data from the mbuf and copy it to the
+ * descriptor assigned DMA address + 16. The 16 bytes before the packet data
+ * are for metadata: sport/dport (depending on our source interface), packet
+ * length and magic 0xcafe. We tell the SUME about the transfer, fill the first
+ * 3*sizeof(uint32_t) bytes of the bouncebuffer with the information about the
+ * start and length of the packet and trigger the transaction.
+ */
 static void
-sume_txeof(struct tx_ring *txr)
+sume_if_start_locked(struct ifnet *ifp)
 {
-	//printf("%s\n", __func__);
-	struct nf_uam_priv *nf_priv = txr->nf_priv;
-	//struct sume_adapter *adapter = nf_priv->adapter;
-	int first, done, processed;
-	struct desc_info *txbuf;
-	struct dma_descriptor *tx_desc;
-	int len = 1560;
-	//len = MCLBYTES;
-
-	if (txr->tx_avail == nf_priv->num_tx_desc) {
-		txr->busy = 0;
-		return;
-	}
-
-	processed = 0;
-	first = nf_priv->tx_ntc;
-	done = nf_priv->tx_ntu;
-
-	while (first != done) {
-		txbuf = &txr->tx_buffers[first];
-		tx_desc = &txr->tx_base[first];
-		++txr->tx_avail;
-		++processed;
-		if (!txbuf->buf) {
-			bus_dmamap_sync(txr->txtag, txbuf->map,
-			    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
-
-			bzero(txbuf->buf, len);
-			txbuf->len = len;
-			tx_desc->size = txbuf->len;
-
-			bus_dmamap_sync(txr->txtag, txbuf->map,
-			    BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
-		}
-		first = RING_NEXT_IDX(first);
-	}
-
-	nf_priv->tx_ntc = first;
-
-	if (processed == 0) {
-		if (txr->busy != 10)
-			++txr->busy;
-	} else
-		txr->busy = 1;
-
-	if (txr->tx_avail == nf_priv->num_tx_desc)
-		txr->busy = 0;
-}
-
-static void
-sume_xmit(struct tx_ring *txr, struct mbuf **mp)
-{
-	//printf("%s\n", __func__);
-	struct nf_uam_priv *nf_priv = txr->nf_priv;
-	struct sume_adapter *adapter = nf_priv->adapter;
 	struct mbuf *m;
-	struct desc_info *txbuf;
-	struct dma_descriptor *cur_txd = NULL;
-	int plen = SUME_MIN_PKT_SIZE;
+	struct nf_uam_priv *nf_priv = ifp->if_softc;
+	struct sume_adapter *adapter = nf_priv->adapter;
 	struct nf_metadata *mdata;
+	int plen = SUME_MIN_PKT_SIZE;
+	struct dma_core *dma;
+	struct dma_engine *tx_engine;
+	struct dma_descriptor *desc;
+	struct dma_descriptor *desc_base;
+	struct desc_info *info;
 
-	m = *mp;
+	if (!(ifp->if_flags & IFF_UP))
+		return;
+
+	dma = adapter->dma;
+
+	tx_engine = dma->dma_engine + DMA_ENG_TX;
+	desc_base = tx_engine->dma_descriptor;
+
+	IFQ_DEQUEUE(&ifp->if_snd, m);
+	if (m == NULL)
+		return;
+
+tryagain:
+	desc = desc_base + nf_priv->tx_ntu;
+	info = nf_priv->tx_desc_info + nf_priv->tx_ntu;
+
+	bus_dmamap_sync(adapter->my_tag, info->map,
+	    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
+
+	/* Packets large enough do not need to be padded */
 	if (m->m_pkthdr.len > SUME_MIN_PKT_SIZE)
 		plen = m->m_pkthdr.len;
 
-	txbuf = &txr->tx_buffers[nf_priv->tx_ntu];
-	cur_txd = &txr->tx_base[nf_priv->tx_ntu];
-
-	bus_dmamap_sync(txr->txtag, txbuf->map,
-	    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
-
-	mdata = (struct nf_metadata *) txbuf->buf;
+	mdata = (struct nf_metadata *) info->buf;
 
 	/* Make sure we fit with the 16 bytes nf_metadata. */
 	if ((m->m_pkthdr.len + sizeof(struct nf_metadata)) >
@@ -467,81 +385,43 @@ sume_xmit(struct tx_ring *txr, struct mbuf **mp)
 		return;
 	}
 
-	//if (adapter->sume_debug)
-		//printf("Sending %d bytes to nf%d\n", plen, nf_priv->unit);
-
-	txbuf->len = plen + sizeof(struct nf_metadata);
-	cur_txd->size = txbuf->len;
+	info->len = plen + sizeof(struct nf_metadata);
 
 	/* Zero out the padded data */
 	if (m->m_pkthdr.len < SUME_MIN_PKT_SIZE)
-		bzero(txbuf->buf + sizeof(struct nf_metadata), SUME_MIN_PKT_SIZE);
+		bzero(info->buf + sizeof(struct nf_metadata), SUME_MIN_PKT_SIZE);
 	/* Skip the first 16 bytes for the metadata. */
-	m_copydata(m, 0, m->m_pkthdr.len, txbuf->buf + sizeof(struct nf_metadata));
+	m_copydata(m, 0, m->m_pkthdr.len, info->buf + sizeof(struct nf_metadata));
 	m_freem(m);
-	m = NULL;
 
 	/* Fill in the metadata: CPU(DMA) ports are odd, MAC ports are even. */
 	mdata->sport = htole16(1 << (nf_priv->port * 2 + 1));
 	mdata->dport = htole16(1 << (nf_priv->port * 2));
-	mdata->plen = htole16(txbuf->len);
+	mdata->plen = htole16(info->len);
 	mdata->magic = htole16(SUME_RIFFA_MAGIC);
 	mdata->t1 = htole32(0);
 	mdata->t2 = htole32(0);
 
-	nf_priv->tx_ntu = RING_NEXT_IDX(nf_priv->tx_ntu);
+	adapter->last_ifc = nf_priv->port;
 
-	txr->tx_avail--;
+	memcpy(&desc->size, &info->len, 8);
 
-	bus_dmamap_sync(txr->txtag, txbuf->map,
+	bus_dmamap_sync(adapter->my_tag, info->map,
 	    BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
-}
 
-static void
-sume_msix_rxtx(void *arg)
-{
-	//printf("INTERRUPT\n");
-	struct nf_uam_priv *nf_priv = arg;
-	//struct tx_ring *txr = nf_priv->txr;
-	struct rx_ring *rxr = nf_priv->rxr;
-	struct sume_adapter *adapter = nf_priv->adapter;
+	nf_priv->tx_ntu = RING_NEXT_IDX(nf_priv->tx_ntu);
+	nf_priv->tx_ntc = RING_NEXT_IDX(nf_priv->tx_ntc);
 
-        adapter->dma->dma_common_block.irq_enable = 0;
-	sume_msix_rx(rxr);
-	//sume_msix_tx(txr);
-        adapter->dma->dma_common_block.irq_enable = 1;
-}
+	IFQ_DEQUEUE(&ifp->if_snd, m);
+	if (m != NULL)
+		goto tryagain;
 
-#define	SUME_TX_CLEANUP_THRESH		NUM_DESCRIPTORS / 8
-
-static void
-sume_start_locked(struct ifnet *ifp)
-{
-	//printf("%s\n", __func__);
-	struct nf_uam_priv *nf_priv = ifp->if_softc;
-	struct sume_adapter *adapter = nf_priv->adapter;
-	struct tx_ring *txr = nf_priv->txr;
-	struct mbuf *m;
-
-	do {
-		if (txr->tx_avail <= SUME_TX_CLEANUP_THRESH)
-			sume_txeof(txr);
-
-		IFQ_DEQUEUE(&ifp->if_snd, m);
-		if (m == NULL)
-			break;
-
-		sume_xmit(txr, &m);
-
-		if (txr->busy == 0)
-			txr->busy = 1;
-
-		/* Send a copy of the frame to the BPF listener */
-		//ETHER_BPF_MTAP(ifp, m);
-	} while (m != NULL);
-
-	//printf("Setting TX tail to %d\n", RING_PREV_IDX(nf_priv->tx_ntu));
 	write_reg(adapter, TAIL_TX_OFFSET, RING_PREV_IDX(nf_priv->tx_ntu));
+	
+	nf_priv->stats.tx_packets++;
+	nf_priv->stats.tx_bytes += plen;
+
+	return;
 }
 
 static void
@@ -554,139 +434,104 @@ reset_core_dma(struct sume_adapter *adapter)
 	memcpy(engine, &val, sizeof(val));
 }
 
-static int
-sume_uam_rx_alloc(struct nf_uam_priv *nf_priv)
+static void
+sume_uam_tx_clean(struct nf_uam_priv *nf_priv)
 {
 	struct sume_adapter *adapter = nf_priv->adapter;
-	struct dma_descriptor *rx_desc;
-	struct dma_engine *rx_engine;
-	struct desc_info *rxbuf;
-	uint64_t len = 1600;
-	//len = MCLBYTES;
-	int n = 0;
-	int error = 0;
-	struct mbuf *m;
-	struct rx_ring *rxr = nf_priv->rxr;
-	bus_dma_segment_t segs[1];
-	int nseg;
+	struct desc_info *info;
 	int i;
 
-	if (nf_priv->port) {
-		//printf("Only nf0 works.\n");
-		return (EINVAL);;
-	}
-
-	rx_engine = adapter->dma->dma_engine + DMA_ENG_RX;
-	rxr->rx_base = rx_engine->dma_descriptor;
-
 	for (i = 0; i < NUM_DESCRIPTORS; i++) {
-		rx_desc = rxr->rx_base + i;
-		rxbuf = rxr->rx_buffers + i;
-		rxbuf->rb = i;
-
-		bus_dmamap_sync(rxr->rxtag, rxbuf->map,
-		    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
-		if (rxbuf->map)
-			bus_dmamap_unload(rxr->rxtag, rxbuf->map);
-
-		m = m_getjcl(M_WAITOK, MT_DATA, M_PKTHDR, MCLBYTES);
-		if (m == NULL) {
-			device_printf(adapter->dev, "NOMEM\n");
-			continue;
+		info = nf_priv->tx_desc_info + i;
+		if (info->buf) {
+			bus_dmamem_free(adapter->my_tag, info->buf, info->map);
+			bus_dmamap_unload(adapter->my_tag, info->map);
+			bus_dmamap_destroy(adapter->my_tag, info->map);
+			info->buf = NULL;
 		}
-
-		rxbuf->len = m->m_len = m->m_pkthdr.len = len;
-
-		error = bus_dmamap_load_mbuf_sg(rxr->rxtag, rxbuf->map,
-		    m, segs, &nseg, BUS_DMA_WAITOK);
-		if (error) {
-			m_freem(m);
-			device_printf(adapter->dev, "can't map mbuf error %d\n", error);
-			return (ENOMEM);
-		}
-
-		if (nseg != 1) {
-			m_freem(m);
-			bus_dmamap_unload(rxr->rxtag, rxbuf->map);
-			printf("nseg %d != 1\n", nseg);
-			return (ENOMEM);
-		}
-
-		rxbuf->buf = (char *) m;
-
-		bus_dmamap_sync(rxr->rxtag, rxbuf->map,
-		    BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
-
-		rxbuf->paddr = segs->ds_addr;
-
-		//printf("rxbuf->buf = 0x%lx\n", (uint64_t) rxbuf->buf);
-		//printf("rxbuf->paddr = 0x%lx\n", rxbuf->paddr);
-
-		rx_desc->address = rxbuf->paddr;
-		rx_desc->size = rxbuf->len;
-		rx_desc->generate_irq = 1;
-
-		n++;
 	}
+}
 
-	return (0);
+static int
+sume_uam_rx_clean(struct nf_uam_priv *nf_priv)
+{
+	//printf("Start clean\n");
+	struct sume_adapter *adapter = nf_priv->adapter;
+	struct dma_engine *engine;
+	struct dma_descriptor *desc;
+	struct desc_info *info;
+	struct mbuf *m;
+	int n = 0;
+
+	engine = adapter->dma->dma_engine + DMA_ENG_RX;
+	do {
+		desc = engine->dma_descriptor + nf_priv->rx_ntc;
+		info = nf_priv->rx_desc_info + nf_priv->rx_ntc;
+
+		if (info->buf) {
+			//printf("Cleaning desc %d\n", info->rb);
+			m = (struct mbuf *) info->buf;
+			m_freem(m);
+			info->buf = 0;
+			bus_dmamap_unload(adapter->my_tag, info->map);
+			bus_dmamap_destroy(adapter->my_tag, info->map);
+			n++;
+		}
+	} while ((nf_priv->rx_ntc = RING_NEXT_IDX(nf_priv->rx_ntc)) != nf_priv->rx_ntu);
+
+	bus_dmamap_unload(adapter->my_tag, adapter->my_map);
+	bus_dmamap_destroy(adapter->my_tag, adapter->my_map);
+
+	printf("End clean n = %d\n", n);
+	return 0;
 }
 
 static int
 sume_uam_tx_alloc(struct nf_uam_priv *nf_priv)
 {
-	struct desc_info *txbuf;
+	struct desc_info *info;
 	struct sume_adapter *adapter = nf_priv->adapter;
 	int len = 1560; // ?
-	//len = MCLBYTES;
 	int i, err;
-	struct dma_descriptor *tx_desc;
+	struct dma_descriptor *desc_base;
+	struct dma_descriptor *desc;
 	struct dma_engine *tx_engine;
 	tx_engine = adapter->dma->dma_engine + DMA_ENG_TX;
-	struct tx_ring *txr;
-
-	if (nf_priv->port) {
-		//printf("Only nf0 works.\n");
-		return (EINVAL);;
-	}
-
-	txr = nf_priv->txr;
-	txr->tx_base = tx_engine->dma_descriptor;
+	desc_base = tx_engine->dma_descriptor;
 
 	for (i = 0; i < NUM_DESCRIPTORS; i++) {
-		txbuf = txr->tx_buffers + i;
-		tx_desc = txr->tx_base + i;
-		txbuf->rb = i;
-		if (!txbuf->buf) {
-			err = bus_dmamem_alloc(txr->txtag, (void **)
-			    &txbuf->buf, BUS_DMA_WAITOK | BUS_DMA_COHERENT |
-			    BUS_DMA_ZERO, &txbuf->map);
+		info = nf_priv->tx_desc_info + i;
+		desc = desc_base + i;
+		info->rb = i;
+		if (!info->buf) {
+			err = bus_dmamem_alloc(adapter->my_tag, (void **)
+			    &info->buf, BUS_DMA_WAITOK | BUS_DMA_COHERENT |
+			    BUS_DMA_ZERO, &info->map);
 			if (err) {
 				device_printf(adapter->dev, "%s: bus_dmamem_alloc "
-				    "txbuf->buf failed.\n", __func__);
+				    "info->buf failed.\n", __func__);
 				return (err);
 			}
 
-			bzero(txbuf->buf, len);
+			bzero(info->buf, len);
 
-			if (!txbuf->buf) {
-				sume_free_tx_buffers(txr);
+			//info->buf = malloc(len, M_SUME, M_ZERO | M_WAITOK);
+			if (!info->buf) {
+				sume_uam_tx_clean(nf_priv);
 				return (ENOMEM);
 			}
-
-			err = bus_dmamap_load(txr->txtag, txbuf->map, txbuf->buf, len,
-			    callback_dma, &txbuf->paddr, BUS_DMA_NOWAIT);
+			// DESK
+			err = bus_dmamap_load(adapter->my_tag, info->map, info->buf, len,
+			    callback_dma, &info->paddr, BUS_DMA_NOWAIT);
 			if (err) {
-				sume_free_tx_buffers(txr);
+				sume_uam_tx_clean(nf_priv);
 				device_printf(adapter->dev, "%s: bus_dmamap_load "
 				    "paddr failed.\n", __func__);
 				return (err);
 			}
-
-			tx_desc->address = txbuf->paddr;
-
-			tx_desc->generate_irq = 1;
-			bus_dmamap_sync(txr->txtag, txbuf->map,
+			memcpy(&desc->address, &info->paddr, 8);
+			desc->generate_irq = 1;
+			bus_dmamap_sync(adapter->my_tag, info->map,
 			    BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
 		}
 	}
@@ -697,100 +542,70 @@ sume_uam_tx_alloc(struct nf_uam_priv *nf_priv)
 static int
 sume_uam_rx_refill(struct nf_uam_priv *nf_priv)
 {
+	//printf("Reffil start\n");
 	struct sume_adapter *adapter = nf_priv->adapter;
-	struct dma_descriptor *rx_desc;
-	struct desc_info *rxbuf;
+	struct dma_descriptor *desc_base;
+	struct dma_descriptor *desc;
+	struct dma_engine *engine;
+	struct desc_info *info;
 	uint64_t len = 1600;
-	//len = MCLBYTES;
 	int n = 0;
 	int error = 0;
 	struct mbuf *m;
-	struct rx_ring *rxr = nf_priv->rxr;
 	bus_dma_segment_t segs[1];
 	int nseg;
-	bus_dmamap_t map;
 
-	if (nf_priv->port) {
-		//printf("Only nf0 works.\n");
-		return (EINVAL);;
-	}
-
+	engine = adapter->dma->dma_engine + DMA_ENG_RX;
+	desc_base = engine->dma_descriptor;
 	do {
-		rx_desc = rxr->rx_base + nf_priv->rx_ntu;
-		rxbuf = rxr->rx_buffers + nf_priv->rx_ntu;
+		desc = desc_base + nf_priv->rx_ntu;
 
-		//printf("Refilling %d\n", rxbuf->rb);
-		//printf("old buf = 0x%lx\n", (uint64_t) rxbuf->buf);
-		//printf("old paddr = 0x%lx\n", (uint64_t) rxbuf->paddr);
+		info = nf_priv->rx_desc_info + nf_priv->rx_ntu;
+		info->rb = nf_priv->rx_ntu;
 
-		//m = m_getjcl(M_USE_RESERVE | M_NOWAIT, MT_DATA, M_PKTHDR, MCLBYTES);
-		m = m_getjcl(M_WAITOK, MT_DATA, M_PKTHDR, MCLBYTES);
+		bus_dmamap_sync(adapter->my_tag, info->map,
+		    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
+		bus_dmamap_unload(adapter->my_tag, info->map);
+
+		m = m_getcl(M_WAITOK, MT_DATA, M_PKTHDR);
 		if (m == NULL) {
-			device_printf(adapter->dev, "No memory for mbuf\n");
+			printf("NOMEM\n");
 			continue;
+			return (ENOMEM);
 		}
 
-		rxbuf->len = m->m_len = m->m_pkthdr.len = len;
+                info->len = len;
+		info->buf = (char *) m;
 
-		//if (rxbuf->buf != NULL) {
-			//bus_dmamap_sync(rxr->rxtag, rxbuf->map, BUS_DMASYNC_POSTREAD);
-			//bus_dmamap_unload(rxr->rxtag, rxbuf->map);
-		//}
+		m->m_len = m->m_pkthdr.len = len;
 
-		//error = bus_dmamap_load_mbuf_sg(rxr->rxtag, rxbuf->map,
-		    //m, segs, &nseg, BUS_DMA_NOWAIT);
-		//error = bus_dmamap_load_mbuf_sg(rxr->rxtag, rxbuf->map,
-		    //m, segs, &nseg, BUS_DMA_WAITOK | BUS_DMA_NOCACHE);
-
-		//error = bus_dmamap_load_mbuf_sg(nf_priv->spare_tag, nf_priv->spare_map,
-		    //m, segs, &nseg, BUS_DMA_WAITOK | BUS_DMA_NOCACHE);
-		//error = bus_dmamap_load_mbuf_sg(rxr->rxtag, rxbuf->map,
-		    //m, segs, &nseg, BUS_DMA_WAITOK);
-		error = bus_dmamap_load_mbuf_sg(nf_priv->spare_tag, nf_priv->spare_map,
-		    m, segs, &nseg, BUS_DMA_WAITOK);
+		error = bus_dmamap_load_mbuf_sg(adapter->my_tag, info->map,
+		    m, segs, &nseg, BUS_DMA_NOWAIT);
 		if (error) {
 			m_freem(m);
 			device_printf(adapter->dev, "can't map mbuf error %d\n", error);
 			return (ENOMEM);
 		}
 
-#if 0
 		if (nseg != 1) {
 			m_freem(m);
-			bus_dmamap_unload(rxr->rxtag, rxbuf->map);
-			printf("nseg %d != 1\n", nseg);
+			bus_dmamap_unload(adapter->my_tag, info->map);
+			printf("nseg != 1\n");
 			return (ENOMEM);
 		}
-#endif
 
-		bus_dmamap_sync(rxr->rxtag, rxbuf->map,
-		    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
-		bus_dmamap_unload(rxr->rxtag, rxbuf->map);
-
-		map = rxbuf->map;
-		rxbuf->map = nf_priv->spare_map;
-		nf_priv->spare_map = map;
-
-		rxbuf->buf = (char *) m;
-		rxbuf->paddr = segs->ds_addr;
-
-		//printf("new buf = 0x%lx\n", (uint64_t) rxbuf->buf);
-		//printf("new paddr = 0x%lx\n", (uint64_t) rxbuf->paddr);
-
-		bus_dmamap_sync(rxr->rxtag, rxbuf->map,
+		bus_dmamap_sync(adapter->my_tag, info->map,
 		    BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
 
-		rx_desc->address = rxbuf->paddr;
-		rx_desc->size = rxbuf->len;
-                rx_desc->generate_irq = 1;
+		info->paddr = segs->ds_addr;
 
-		rxr->rx_avail++;
+		memcpy(&desc->address, &info->paddr, 8);
+		memcpy(&desc->size, &info->len, 8);
+                desc->generate_irq = 1;
+
                 n++;
+
 	} while ((nf_priv->rx_ntu = RING_NEXT_IDX(nf_priv->rx_ntu)) != nf_priv->rx_ntc);
-
-	//if (n)
-		//write_reg(adapter, TAIL_RX_OFFSET, nf_priv->rx_ntu);
-
 
 	return (0);
 }
@@ -800,15 +615,10 @@ sume_uam_up(struct sume_adapter *adapter, struct ifnet *ifp)
 {
 	printf("UP\n");
 	struct nf_uam_priv *nf_priv = ifp->if_softc;
-	//int err; //, i;
-	//device_t dev = adapter->dev;
+	//char msix_name[32];
+	int err; //, i;
+	device_t dev = adapter->dev;
 
-	if (nf_priv->port) {
-		printf("Only nf0 works.\n");
-		return;
-	}
-
-#if 0
 	/* Is this needed? */
 	if (!pcie_flr(dev, max(pcie_get_max_completion_timeout(dev) / 1000, 10), true)) {
 		device_printf(dev, "PCIE FLR failed\n");
@@ -822,21 +632,43 @@ sume_uam_up(struct sume_adapter *adapter, struct ifnet *ifp)
 	}
 
 	reset_core_dma(adapter);
-#endif
 
-	nf_priv->rx_ntu = nf_priv->rx_ntc =
-	    nf_priv->adapter->dma->dma_engine[DMA_ENG_RX].head;
-	nf_priv->tx_ntu = nf_priv->tx_ntc =
-	    nf_priv->adapter->dma->dma_engine[DMA_ENG_TX].head;
+	memset(nf_priv->tx_desc_info, 0, sizeof(nf_priv->tx_desc_info));
+	memset(nf_priv->rx_desc_info, 0, sizeof(nf_priv->rx_desc_info));
 
-	printf("nf_priv->rx_ntu = %d\n", nf_priv->rx_ntu);
-	printf("nf_priv->rx_ntc = %d\n", nf_priv->rx_ntc);
-	printf("nf_priv->tx_ntu = %d\n", nf_priv->tx_ntu);
-	printf("nf_priv->tx_ntc = %d\n", nf_priv->tx_ntc);
+	err = bus_dmamap_create(adapter->my_tag, 0,
+            &adapter->my_map);
+        if (err != 0) {
+                device_printf(dev,
+                    "could not create Rx spare DMA map\n");
+                return;
+        }
 
-	adapter->rx_process_limit = NUM_DESCRIPTORS - 1;
-	nf_priv->ctr = 0;
+	err = sume_uam_rx_refill(nf_priv);
+	if (err) {
+		device_printf(adapter->dev, "Failed to allocate RX buffers\n");
+		return;
+	}
 
+	printf("rx_engine->head = %d\n", nf_priv->adapter->dma->dma_engine[0].head);
+	printf("rx_engine->tail = %d\n", nf_priv->adapter->dma->dma_engine[0].tail);
+	printf("tx_engine->head = %d\n", nf_priv->adapter->dma->dma_engine[1].head);
+	printf("tx_engine->tail = %d\n", nf_priv->adapter->dma->dma_engine[1].tail);
+	nf_priv->rx_ntu = nf_priv->adapter->dma->dma_engine[0].head;
+	nf_priv->rx_ntc = RING_PREV_IDX(nf_priv->rx_ntu);
+	nf_priv->tx_ntu = nf_priv->adapter->dma->dma_engine[1].head;
+	nf_priv->tx_ntc = RING_PREV_IDX(nf_priv->tx_ntu);
+
+	adapter->rx_budget = NUM_DESCRIPTORS - 1;
+
+	err = sume_uam_tx_alloc(nf_priv);
+	if (err) {
+		device_printf(adapter->dev, "Failed to allocate TX buffers\n");
+		sume_uam_rx_clean(nf_priv);
+		return;
+	}
+
+	nf_priv->rx_ntc = nf_priv->adapter->dma->dma_engine[0].head;
 	nf_priv->adapter->dma->dma_common_block.irq_enable = 1;
 }
 
@@ -846,11 +678,12 @@ sume_uam_down(struct sume_adapter *adapter, struct ifnet *ifp)
 	printf("DOWN\n");
 	struct nf_uam_priv *nf_priv = ifp->if_softc;
 
-	if (nf_priv->port) {
-		//printf("Only nf0 works.\n");
-		return;
-	}
+        nf_priv->adapter->dma->dma_common_block.irq_enable = 0;
 
+        sume_uam_tx_clean(nf_priv);
+        sume_uam_rx_clean(nf_priv);
+
+	return;
 }
 
 static int
@@ -861,7 +694,7 @@ sume_if_ioctl(struct ifnet *ifp, unsigned long cmd, caddr_t data)
 	struct sume_ifreq sifr;
 	int error = 0;
 	struct sume_adapter *adapter = nf_priv->adapter;
-#if 1
+#if 0
 	struct dma_engine *rx_engine = adapter->dma->dma_engine + DMA_ENG_RX;
 	struct dma_engine *tx_engine = adapter->dma->dma_engine + DMA_ENG_TX;
 #endif
@@ -873,23 +706,13 @@ sume_if_ioctl(struct ifnet *ifp, unsigned long cmd, caddr_t data)
 		break;
 
 	case SUME_IOCTL_CMD_WRITE_REG:
-#if 1
-	//reset_core_dma(adapter);
-	printf("Engines finished = 0x%x\n", adapter->dma->dma_common_block.engine_finished);
+#if 0
 	printf("rx_engine->head = %d\n", rx_engine->head);
 	printf("rx_engine->tail = %d\n", rx_engine->tail);
 	printf("tx_engine->head = %d\n", tx_engine->head);
 	printf("tx_engine->tail = %d\n", tx_engine->tail);
 	printf("nf_priv->rx_ntc = %d\n", nf_priv->rx_ntc);
 	printf("nf_priv->rx_ntu = %d\n", nf_priv->rx_ntu);
-	//adapter->dma->dma_common_block.user_reset = 1;
-	//printf("Engines finished = 0x%x\n", adapter->dma->dma_common_block.engine_finished);
-	//printf("rx_engine->head = %d\n", rx_engine->head);
-	//printf("rx_engine->tail = %d\n", rx_engine->tail);
-	//printf("tx_engine->head = %d\n", tx_engine->head);
-	//printf("tx_engine->tail = %d\n", tx_engine->tail);
-	//printf("nf_priv->rx_ntc = %d\n", nf_priv->rx_ntc);
-	//printf("nf_priv->rx_ntu = %d\n", nf_priv->rx_ntu);
 	break;
 #endif
 
@@ -983,362 +806,6 @@ sume_media_status(struct ifnet *ifp, struct ifmediareq *ifmr)
 		ifmr->ifm_status |= IFM_ACTIVE;
 }
 
-static void
-sume_free_rx_buffers(struct rx_ring *rxr)
-{
-	struct desc_info *rxbuf;
-	struct nf_uam_priv *nf_priv = rxr->nf_priv;
-	struct mbuf *m;
-	int i;
-
-	if (!rxr)
-		return;
-
-	for (i = 0; i < nf_priv->num_rx_desc; i++) {
-		if (!rxr->rx_buffers)
-			continue;
-		rxbuf = &rxr->rx_buffers[i];
-		if (!rxbuf)
-			continue;
-
-		m = (struct mbuf *) rxbuf->buf;
-		if (m) {
-			bus_dmamap_unload(rxr->rxtag, rxbuf->map);
-			m_freem(m);
-			rxbuf->buf = NULL;
-			if (rxbuf->map) {
-				bus_dmamap_destroy(rxr->rxtag, rxbuf->map);
-				rxbuf->map = NULL;
-			}
-		} else if (rxbuf->map) {
-			bus_dmamap_unload(rxr->rxtag, rxbuf->map);
-			bus_dmamap_destroy(rxr->rxtag, rxbuf->map);
-			rxbuf->map = NULL;
-		}
-	}
-
-	if (rxr->rx_buffers) {
-		free(rxr->rx_buffers, M_SUME);
-		rxr->rx_buffers = NULL;
-	}
-
-	if (rxr->rxtag) {
-		bus_dma_tag_destroy(rxr->rxtag);
-		rxr->rxtag = NULL;
-	}
-}
-
-static void
-sume_free_tx_buffers(struct tx_ring *txr)
-{
-	struct desc_info *txbuf;
-	struct nf_uam_priv *nf_priv = txr->nf_priv;
-	int i;
-
-	if (!txr)
-		return;
-
-	for (i = 0; i < nf_priv->num_tx_desc; i++) {
-		if (!txr->tx_buffers)
-			continue;
-		txbuf = &txr->tx_buffers[i];
-		if (!txbuf)
-			continue;
-
-		if (txbuf->buf) {
-			bus_dmamap_unload(txr->txtag, txbuf->map);
-			bus_dmamem_free(txr->txtag, txbuf->buf, txbuf->map);
-			txbuf->buf = NULL;
-			if (txbuf->map) {
-				bus_dmamap_destroy(txr->txtag, txbuf->map);
-				txbuf->map = NULL;
-			}
-		} else if (txbuf->map) {
-			bus_dmamap_unload(txr->txtag, txbuf->map);
-			bus_dmamap_destroy(txr->txtag, txbuf->map);
-			txbuf->map = NULL;
-		}
-	}
-
-	if (txr->tx_buffers) {
-		free(txr->tx_buffers, M_SUME);
-		txr->tx_buffers = NULL;
-	}
-
-	if (txr->txtag) {
-		bus_dma_tag_destroy(txr->txtag);
-		txr->txtag = NULL;
-	}
-}
-
-static void
-sume_free_spare(struct nf_uam_priv *nf_priv)
-{
-	if (nf_priv->spare_map) {
-		bus_dmamap_unload(nf_priv->spare_tag, nf_priv->spare_map);
-		bus_dmamap_destroy(nf_priv->spare_tag, nf_priv->spare_map);
-		nf_priv->spare_map = NULL;
-	}
-
-	if (nf_priv->spare_tag) {
-		bus_dma_tag_destroy(nf_priv->spare_tag);
-		nf_priv->spare_tag = NULL;
-	}
-}
-
-static int
-sume_create_spare(struct nf_uam_priv *nf_priv)
-{
-	struct sume_adapter *adapter = nf_priv->adapter;
-	device_t dev = adapter->dev;
-	int error;
-	int size = 1600;
-	//size = MCLBYTES;
-
-	error = bus_dma_tag_create(bus_get_dma_tag(dev),
-	    1, 0,
-	    BUS_SPACE_MAXADDR,
-	    BUS_SPACE_MAXADDR,
-	    NULL, NULL,
-	    size,
-	    1,
-	    size,
-	    0,
-	    NULL,
-	    NULL,
-	    &nf_priv->spare_tag);
-
-	if (error) {
-		device_printf(dev, "%s: bus_dma_tag_create) "
-		    "failed.\n", __func__);
-		goto fail;
-	}
-
-	/* Create spare DMA map for RX buffers. */
-        error = bus_dmamap_create(nf_priv->spare_tag, 0, &nf_priv->spare_map);
-        if (error != 0) {
-                device_printf(dev, "cannot create spare DMA map for RX.\n");
-                goto fail;
-        }
-
-	return (0);
-fail:
-	sume_free_spare(nf_priv);
-
-	return (error);
-
-}
-
-static int
-sume_rx_buffers(struct rx_ring *rxr)
-{
-	struct sume_adapter *adapter = rxr->adapter;
-	struct nf_uam_priv *nf_priv = rxr->nf_priv;
-	device_t dev = adapter->dev;
-	struct desc_info *rxbuf;
-	int error;
-	int size = 1600;
-	//size = MCLBYTES;
-	int i;
-
-	error = bus_dma_tag_create(bus_get_dma_tag(dev),
-	    1, 0,
-	    BUS_SPACE_MAXADDR,
-	    BUS_SPACE_MAXADDR,
-	    NULL, NULL,
-	    size * NUM_DESCRIPTORS,
-	    1,
-	    size,
-	    0,
-	    NULL,
-	    NULL,
-	    &rxr->rxtag);
-
-	if (error) {
-		device_printf(dev, "%s: bus_dma_tag_create) "
-		    "failed.\n", __func__);
-		goto fail;
-	}
-
-	if (!(rxr->rx_buffers = malloc(sizeof(struct desc_info) *
-	    nf_priv->num_rx_desc, M_SUME, M_NOWAIT | M_ZERO))) {
-		device_printf(dev, "NO TX_BUFFER");
-		error = ENOMEM;
-		goto fail;
-	}
-
-	rxbuf = &rxr->rx_buffers[0];
-	for (i = 0; i < nf_priv->num_rx_desc; i++, rxbuf++) {
-		error = bus_dmamap_create(rxr->rxtag, 0, &rxbuf->map);
-		if (error) {
-			device_printf(dev, "Unable to create TX DMA\n");
-			goto fail;
-		}
-	}
-
-	return (0);
-
-fail:
-	sume_free_rx_buffers(rxr);
-
-	return (error);
-}
-
-static int
-sume_tx_buffers(struct tx_ring *txr)
-{
-	struct sume_adapter *adapter = txr->adapter;
-	struct nf_uam_priv *nf_priv = txr->nf_priv;
-	device_t dev = adapter->dev;
-	struct desc_info *txbuf;
-	int error;
-	int size = 1560;
-	//size = MCLBYTES;
-	int i;
-
-	error = bus_dma_tag_create(bus_get_dma_tag(dev),
-	    1, 0,
-	    BUS_SPACE_MAXADDR,
-	    BUS_SPACE_MAXADDR,
-	    NULL, NULL,
-	    size * NUM_DESCRIPTORS,
-	    1,
-	    size,
-	    0,
-	    NULL,
-	    NULL,
-	    &txr->txtag);
-
-	if (error) {
-		device_printf(dev, "%s: bus_dma_tag_create) "
-		    "failed.\n", __func__);
-		goto fail;
-	}
-
-	if (!(txr->tx_buffers = malloc(sizeof(struct desc_info) *
-	    nf_priv->num_tx_desc, M_SUME, M_NOWAIT | M_ZERO))) {
-		device_printf(dev, "NO TX_BUFFER");
-		error = ENOMEM;
-		goto fail;
-	}
-
-	txbuf = &txr->tx_buffers[0];
-	for (i = 0; i < nf_priv->num_tx_desc; i++, txbuf++) {
-		error = bus_dmamap_create(txr->txtag, 0, &txbuf->map);
-		if (error) {
-			device_printf(dev, "Unable to create TX DMA\n");
-			goto fail;
-		}
-	}
-
-	return (0);
-
-fail:
-	sume_free_tx_buffers(txr);
-
-	return (error);
-}
-
-static int
-sume_allocate_queues(struct nf_uam_priv *nf_priv)
-{
-	struct sume_adapter *adapter = nf_priv->adapter;
-	device_t dev = adapter->dev;
-	struct tx_ring *txr = NULL;
-	struct rx_ring *rxr = NULL;
-	int rtsize, error;
-
-	if (nf_priv->port)
-		return (0);
-
-	if (!(nf_priv->txr = malloc(sizeof(struct tx_ring),
-	    M_SUME, M_NOWAIT | M_ZERO))) {
-		device_printf(dev, "Unable to allocate TX ring memory\n");
-		error = ENOMEM;
-		goto fail;
-	}
-
-	if (!(nf_priv->rxr = malloc(sizeof(struct rx_ring),
-	    M_SUME, M_NOWAIT | M_ZERO))) {
-		device_printf(dev, "Unable to allocate RX ring memory\n");
-		error = ENOMEM;
-		goto rx_fail;
-	}
-
-	error = sume_create_spare(nf_priv);
-	if (error)
-		goto rx_fail;
-
-	rtsize = roundup2(NUM_DESCRIPTORS * sizeof(struct dma_descriptor), SUME_DBA_ALIGN);
-
-	txr = nf_priv->txr;
-	txr->nf_priv = nf_priv;
-	txr->adapter = adapter;
-	txr->me = nf_priv->port;
-	txr->tx_avail = nf_priv->num_tx_desc;
-	txr->busy = 0;
-
-	error = sume_tx_buffers(txr);
-	if (error)
-		goto rx_fail;
-
-	snprintf(txr->mtx_name, sizeof(txr->mtx_name), "%s:tx(%d)",
-	    device_get_nameunit(dev), txr->me);
-	mtx_init(&txr->tx_mtx, txr->mtx_name, NULL, MTX_DEF);
-
-	rxr = nf_priv->rxr;
-	rxr->nf_priv = nf_priv;
-	rxr->adapter = adapter;
-	rxr->me = nf_priv->port;
-	rxr->rx_avail = nf_priv->num_rx_desc;
-
-	error = sume_rx_buffers(rxr);
-	if (error)
-		goto rx_fail;
-
-	snprintf(rxr->mtx_name, sizeof(txr->mtx_name), "%s:rx(%d)",
-	    device_get_nameunit(dev), rxr->me);
-	mtx_init(&rxr->rx_mtx, rxr->mtx_name, NULL, MTX_DEF);
-
-	/* Is this needed? */
-	if (!pcie_flr(dev, max(pcie_get_max_completion_timeout(dev) / 1000, 10), true)) {
-		device_printf(dev, "PCIE FLR failed\n");
-		int ps = pci_get_powerstate(dev);
-		if (ps != PCI_POWERSTATE_D0 && ps != PCI_POWERSTATE_D3)
-			pci_set_powerstate(dev, PCI_POWERSTATE_D0);
-		if (pci_get_powerstate(dev) != PCI_POWERSTATE_D3)
-			pci_set_powerstate(dev, PCI_POWERSTATE_D3);
-		pci_set_powerstate(dev, ps);
-		//return;
-	}
-
-	reset_core_dma(adapter);
-
-	memset(txr->tx_buffers, 0, nf_priv->num_tx_desc * sizeof(struct desc_info));
-	memset(rxr->rx_buffers, 0, nf_priv->num_rx_desc * sizeof(struct desc_info));
-
-	error = sume_uam_tx_alloc(nf_priv);
-	if (error) {
-		device_printf(dev, "Failed to allocate TX buffers\n");
-		goto rx_fail;
-	}
-
-	error = sume_uam_rx_alloc(nf_priv);
-	if (error) {
-		device_printf(dev, "Failed to allocate RX buffers\n");
-		goto err_rx_desc;
-	}
-
-	return (0);
-
-err_rx_desc:
-	sume_free_rx_buffers(rxr);
-rx_fail:
-	free(nf_priv->txr, M_SUME);
-fail:
-	return (error);
-}
-
 static int
 sume_ifp_alloc(struct sume_adapter *adapter, uint32_t port)
 {
@@ -1374,8 +841,6 @@ sume_ifp_alloc(struct sume_adapter *adapter, uint32_t port)
 	nf_priv->tx_ntc = 0;
 	nf_priv->rx_ntu = 0;
 	nf_priv->rx_ntc = 0;
-	nf_priv->num_tx_desc = NUM_DESCRIPTORS;
-	nf_priv->num_rx_desc = NUM_DESCRIPTORS;
 
 	uint8_t hw_addr[ETHER_ADDR_LEN] = DEFAULT_ETHER_ADDRESS;
 	hw_addr[ETHER_ADDR_LEN-1] = nf_priv->unit;
@@ -1389,143 +854,22 @@ sume_ifp_alloc(struct sume_adapter *adapter, uint32_t port)
 	ifp->if_drv_flags |= IFF_DRV_RUNNING;
 
 	return (0);
-error:
-	return (error);
-}
-
-static void
-sume_free_msix(struct nf_uam_priv *nf_priv)
-{
-	struct sume_adapter *adapter = nf_priv->adapter;
-	device_t dev = adapter->dev;
-	struct tx_ring *txr = nf_priv->txr;
-	struct rx_ring *rxr = nf_priv->rxr;
-	int rid;
-
-	if (nf_priv->port) {
-		//printf("Only nf0 works.\n");
-		return;
-	}
-
-	if (rxr != NULL) {
-		rid = rxr->msix + 1;
-		if (rxr->tag)
-			bus_teardown_intr(dev, rxr->res, rxr->tag);
-		if (rxr->res)
-			bus_release_resource(dev, SYS_RES_IRQ, rid, rxr->res);
-	}
-
-	if (txr != NULL) {
-		rid = txr->msix + 1;
-		if (txr->tag)
-			bus_teardown_intr(dev, txr->res, txr->tag);
-		if (txr->res)
-			bus_release_resource(dev, SYS_RES_IRQ, rid, txr->res);
-	}
-}
-
-static int
-sume_allocate_msix(struct nf_uam_priv *nf_priv)
-{
-	struct sume_adapter *adapter = nf_priv->adapter;
-	device_t dev = adapter->dev;
-	struct tx_ring *txr = nf_priv->txr;
-	struct rx_ring *rxr = nf_priv->rxr;
-	int port = nf_priv->port;
-	int error;
-	int rid;
-
-	if (nf_priv->port) {
-		//printf("Only nf0 works.\n");
-		return (0);;
-	}
-
-	/* RX interrupts */
-	rid = adapter->vector + 1;
-
-	rxr->res = bus_alloc_resource_any(dev, SYS_RES_IRQ,
-	    &rid, RF_ACTIVE);
-	if (rxr->res == NULL) {
-		device_printf(dev, "Unable to allocate bus resource: IRQ "
-		    "memory for RX interrupt%d\n", port);
-		error = ENXIO;
-		goto error;
-	}
-
-	    //INTR_TYPE_NET, NULL, sume_msix_rx, rxr,
-	if ((error = bus_setup_intr(dev, rxr->res, INTR_MPSAFE |
-	    INTR_TYPE_NET, NULL, sume_msix_rxtx, nf_priv,
-	    &rxr->tag)) != 0) {
-		device_printf(dev, "Failed to setup interrupt for RX "
-		    "rid %d, error %d\n", rid, error);
-		goto error;
-	}
-	bus_describe_intr(dev, rxr->res, rxr->tag, "rx%d", port);
-
-	rxr->msix = adapter->vector++;
-	rxr->nf_priv = nf_priv;
-
-	/* TX interrupts */
-	rid = adapter->vector + 1;
-
-	txr->res = bus_alloc_resource_any(dev, SYS_RES_IRQ,
-	    &rid, RF_ACTIVE);
-	if (txr->res == NULL) {
-		device_printf(dev, "Unable to allocate bus resource: IRQ "
-		    "memory for TX interrupt%d\n", port);
-		error = ENXIO;
-		goto error;
-	}
-
-	    //INTR_TYPE_NET, NULL, sume_msix_tx, txr,
-	if ((error = bus_setup_intr(dev, txr->res, INTR_MPSAFE |
-	    INTR_TYPE_NET, NULL, sume_msix_rxtx, nf_priv,
-	    &txr->tag)) != 0) {
-		device_printf(dev, "Failed to setup interrupt for TX "
-		    "rid %d, error %d\n", rid, error);
-		goto error;
-	}
-
-	bus_describe_intr(dev, txr->res, txr->tag, "tx%d", port);
-
-	txr->msix = adapter->vector++;
-	txr->nf_priv = nf_priv;
-
-	return (0);
 
 error:
-	sume_free_msix(nf_priv);
 	return (error);
-}
-
-static int
-sume_setup_msix(struct sume_adapter *adapter)
-{
-	device_t dev = adapter->dev;
-	int count, error;
-
-	count = pci_msix_count(dev);
-	error = pci_alloc_msix(dev, &count);
-	if (error) {
-		device_printf(dev, "Unable to allocate bus resource: PCI "
-		    "MSI\n");
-		return (ENXIO);
-	}
-
-	return (0);
 }
 
 static int
 sume_probe_riffa_pci(struct sume_adapter *adapter)
 {
 	device_t dev = adapter->dev;
-	int i, error = 0, mps, read_req;
+	int i, error = 0, count, mps, read_req;
 
 	/* 1. PCI device init. */
 	mps = pci_get_max_payload(dev);
 	if (mps != 128) {
 		device_printf(dev, "MPS != 128 (%d)\n", mps);
-		//return (ENXIO); // ?
+		//return (ENXIO);
 	}
 
 	read_req = pci_set_max_read_req(dev, 4096);
@@ -1566,6 +910,7 @@ sume_probe_riffa_pci(struct sume_adapter *adapter)
 
 #ifdef USE_BAR1
 	adapter->rid1 = PCIR_BAR(1);
+	printf("rid1 = %d\n", adapter->rid1);
 	adapter->bar1_addr = bus_alloc_resource_any(dev, SYS_RES_MEMORY,
 	    &adapter->rid1, RF_ACTIVE);
 	if (adapter->bar1_addr == NULL) {
@@ -1614,30 +959,92 @@ sume_probe_riffa_pci(struct sume_adapter *adapter)
         }
 
 	/* 3. Init interrupts. */
-	error = sume_setup_msix(adapter);
-	if (error)
+	count = pci_msix_count(dev);
+	error = pci_alloc_msix(dev, &count);
+	if (error) {
+		device_printf(dev, "Unable to allocate bus resource: PCI "
+		    "MSI\n");
+		error = ENXIO;
 		goto error;
-
-	adapter->vector = 0;
-
-	for (i = 0; i < SUME_NPORTS; i++) {
-		struct nf_uam_priv *nf_priv = adapter->ifp[i]->if_softc;
-		error = sume_allocate_queues(nf_priv);
-		if (error)
-			goto error;
-		error = sume_allocate_msix(nf_priv);
-		if (error) {
-			device_printf(dev, "Failed to allocate MSIX, ifc down\n");
-			sume_free_rx_buffers(nf_priv->rxr);
-			sume_free_tx_buffers(nf_priv->txr);
-			goto error;
-		}
 	}
 
+	adapter->irq0.rid = 1; /* Should be 1, thus says pci_alloc_msi() */
+	adapter->irq0.res = bus_alloc_resource_any(dev, SYS_RES_IRQ,
+	    &adapter->irq0.rid, RF_SHAREABLE | RF_ACTIVE);
+	if (adapter->irq0.res == NULL) {
+		device_printf(dev, "Unable to allocate bus resource: IRQ "
+		    "memory\n");
+		error = ENXIO;
+		goto error;
+	}
+
+	error = bus_setup_intr(dev, adapter->irq0.res, INTR_MPSAFE |
+	    INTR_TYPE_NET, sume_intr_filter, sume_uam_intr_handler, adapter,
+	    &adapter->irq0.tag);
+	if (error) {
+		device_printf(dev, "failed to setup interrupt for rid %d, name"
+		    " %s: %d\n", adapter->irq0.rid, "SUME_INTR0", error);
+		error = ENXIO;
+		goto error;
+	} else
+		bus_describe_intr(dev, adapter->irq0.res, adapter->irq0.tag,
+		    "%s", "SUME_INTR0");
+
+	adapter->irq1.rid = 2; /* Should be 2, thus says pci_alloc_msi() */
+	adapter->irq1.res = bus_alloc_resource_any(dev, SYS_RES_IRQ,
+	    &adapter->irq1.rid, RF_SHAREABLE | RF_ACTIVE);
+	if (adapter->irq1.res == NULL) {
+		device_printf(dev, "Unable to allocate bus resource: IRQ "
+		    "memory\n");
+		error = ENXIO;
+		goto error;
+	}
+
+	error = bus_setup_intr(dev, adapter->irq1.res, INTR_MPSAFE |
+	    INTR_TYPE_NET, sume_intr_filter, sume_uam_intr_handler_tx, adapter,
+	    &adapter->irq1.tag);
+	if (error) {
+		device_printf(dev, "failed to setup interrupt for rid %d, name"
+		    " %s: %d\n", adapter->irq1.rid, "SUME_INTR2", error);
+		error = ENXIO;
+		goto error;
+	} else
+		bus_describe_intr(dev, adapter->irq1.res, adapter->irq1.tag,
+		    "%s", "SUME_INTR2");
+
 	return (0);
+
 error:
 
 	return (error);
+}
+
+static int
+sume_prepare_dma(struct sume_adapter *adapter)
+{
+	device_t dev = adapter->dev;
+	int err;
+
+	err = bus_dma_tag_create(bus_get_dma_tag(dev),
+	    PAGE_SIZE, 0,
+	    BUS_SPACE_MAXADDR,
+	    BUS_SPACE_MAXADDR,
+	    NULL, NULL,
+	    2 * NUM_DESCRIPTORS * 1600, // CHECK
+	    1,
+	    1600, // CHECK
+	    0,
+	    NULL,
+	    NULL,
+	    &adapter->my_tag);
+
+	if (err) {
+		device_printf(dev, "%s: bus_dma_tag_create) "
+		    "failed.\n", __func__);
+		return (err);
+	}
+
+	return (0);
 }
 
 #if 0
@@ -1716,12 +1123,14 @@ sume_attach(device_t dev)
 	adapter->dev = dev;
 	int error;
 
-	mtx_init(&adapter->lock, "Global lock", NULL, MTX_DEF);
-
 	/* OK finish up RIFFA. */
 	error = sume_probe_riffa_pci(adapter);
 	if (error != 0)
 		goto error;
+
+	sume_prepare_dma(adapter);
+
+	mtx_init(&adapter->lock, "Global lock", NULL, MTX_DEF);
 
 	return (0);
 error:
@@ -1734,10 +1143,23 @@ static int
 sume_detach(device_t dev)
 {
 	struct sume_adapter *adapter = device_get_softc(dev);
-
 	sume_free_ifp(adapter);
 
+	if (adapter->irq0.tag)
+		bus_teardown_intr(dev, adapter->irq0.res, adapter->irq0.tag);
+	if (adapter->irq0.res)
+		bus_release_resource(dev, SYS_RES_IRQ, adapter->irq0.rid,
+		    adapter->irq0.res);
+
+	if (adapter->irq1.tag)
+		bus_teardown_intr(dev, adapter->irq1.res, adapter->irq1.tag);
+	if (adapter->irq1.res)
+		bus_release_resource(dev, SYS_RES_IRQ, adapter->irq1.rid,
+		    adapter->irq1.res);
+
 	pci_release_msi(dev);
+
+	bus_dma_tag_destroy(adapter->my_tag);
 
 	if (adapter->bar0_addr)
 		bus_release_resource(dev, SYS_RES_MEMORY, adapter->rid0,

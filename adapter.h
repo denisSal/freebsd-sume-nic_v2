@@ -55,10 +55,6 @@
 
 #define	SUME_LOCK(adapter)		mtx_lock(&adapter->lock);
 #define	SUME_UNLOCK(adapter)		mtx_unlock(&adapter->lock);
-#define	SUME_TX_LOCK(_sc)		mtx_lock(&(_sc)->tx_mtx)
-#define	SUME_RX_LOCK(_sc)		mtx_lock(&(_sc)->rx_mtx)
-#define	SUME_TX_UNLOCK(_sc)		mtx_unlock(&(_sc)->tx_mtx)
-#define	SUME_RX_UNLOCK(_sc)		mtx_unlock(&(_sc)->rx_mtx)
 
 /* Currently SUME only uses 2 fixed channels for all port traffic and regs. */
 #define	SUME_RIFFA_CHANNEL_DATA		0
@@ -169,8 +165,6 @@
 #define	AXI4LITE_MASK 0x000FFFFF
 #define	BASE_ADDRESS_MASK ~AXI4LITE_MASK
 
-#define	SUME_DBA_ALIGN			PAGE_SIZE
-
 struct dma_descriptor {
   uint64_t  address;
   uint64_t  size;
@@ -244,11 +238,11 @@ struct dma_core {
 
 struct desc_info {
 	bus_addr_t		paddr;
-	//bus_dma_tag_t		tag;
+	bus_dma_tag_t		tag;
 	bus_dmamap_t		map;
+	bus_dmamap_t		my_map;
 	uint64_t len;
 	char *buf;
-	//struct mbuf *m;
 	int rb;
 };
 
@@ -272,8 +266,10 @@ struct nf_uam_priv {
 	uint32_t rx_ntu;
 	uint32_t rx_ntc;
 
-	//struct desc_info tx_desc_info[NUM_DESCRIPTORS];
-	//struct desc_info rx_desc_info[NUM_DESCRIPTORS];
+	struct desc_info tx_desc_info[NUM_DESCRIPTORS];
+	struct desc_info rx_desc_info[NUM_DESCRIPTORS];
+
+	//struct napi_struct napi;
 
 	/* MY */
 	struct ifmedia		media;
@@ -281,17 +277,6 @@ struct nf_uam_priv {
 	uint32_t		port_up;
 	uint32_t		last_head;
 	struct nf_stats		stats;
-
-	/* Descs */
-	struct tx_ring		*txr;
-	uint32_t		num_tx_desc;
-	struct rx_ring		*rxr;
-	uint32_t		num_rx_desc;
-
-	bus_dma_tag_t		spare_tag;
-	bus_dmamap_t		spare_map;
-
-	uint64_t		ctr;
 };
 /********/
 
@@ -333,68 +318,6 @@ struct nf_priv {
 	struct nf_stats		stats;
 };
 
-struct sume_dma_alloc {
-	bus_addr_t		dma_paddr;
-	caddr_t			dma_vaddr;
-	bus_dma_tag_t		dma_tag;
-	bus_dmamap_t		dma_map;
-	bus_dma_segment_t	dma_seg;
-	uint32_t		dma_nseg;
-	uint64_t		len;
-	char			*buf;
-	int			rb;
-};
-
-struct tx_ring {
-	struct sume_adapter	*adapter;
-	struct nf_uam_priv	*nf_priv;
-	uint32_t		me;
-	struct mtx		tx_mtx;
-	char			mtx_name[16];
-	uint32_t		msix;
-	uint32_t		busy;
-	//struct sume_dma_alloc	txdma;
-	struct dma_descriptor	*tx_base;
-	struct task		tx_task;
-	struct taskqueue	*tq;
-	uint32_t		next_avail_desc;
-	uint32_t		next_to_clean;
-	struct desc_info	*tx_buffers;
-	volatile uint16_t	tx_avail;
-
-	/* Interrupt resources */
-	bus_dma_tag_t		txtag;
-	void			*tag;
-	struct resource		*res;
-	uint64_t		tx_irq;
-	uint64_t		no_desc_avail;
-};
-
-struct rx_ring {
-	struct sume_adapter	*adapter;
-	struct nf_uam_priv	*nf_priv;
-	uint32_t		me;
-	struct mtx		rx_mtx;
-	char			mtx_name[16];
-	uint32_t		msix;
-	uint32_t		payload;
-	//struct sume_dma_alloc	rxdma;
-	struct dma_descriptor	*rx_base;
-	struct task		rx_task;
-	struct taskqueue	*tq;
-	uint32_t		next_avail_desc;
-	uint32_t		next_to_clean;
-	struct desc_info	*rx_buffers;
-	volatile uint16_t	rx_avail;
-
-	/* Interrupt resources */
-	bus_dma_tag_t		rxtag;
-	void			*tag;
-	struct resource		*res;
-	uint64_t		rx_irq;
-	uint64_t		no_desc_avail;
-};
-
 struct sume_adapter {
 	device_t		dev;
 	uint32_t		rid0;
@@ -415,9 +338,8 @@ struct sume_adapter {
 	bus_space_tag_t		bt2;
 	bus_space_handle_t	bh2;
 
-	struct irq		irqs[NUM_DMA_ENGINES];
-	//struct irq		irq1;
-	//struct irq		irq2;
+	struct irq		irq0;
+	struct irq		irq1;
 
 	uint32_t		num_chnls;
 	uint32_t		num_sg;
@@ -437,9 +359,7 @@ struct sume_adapter {
 	bus_dma_tag_t		my_tag;
 	bus_dmamap_t		my_map;
 
-	uint32_t		rx_process_limit;
-
-	uint32_t		vector;
+	uint32_t		rx_budget;
 };
 
 /* SUME metadata:
