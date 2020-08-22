@@ -1030,7 +1030,7 @@ sume_prepare_dma(struct sume_adapter *adapter)
 	    BUS_SPACE_MAXADDR,
 	    BUS_SPACE_MAXADDR,
 	    NULL, NULL,
-	    2 * NUM_DESCRIPTORS * 1600, // CHECK
+	    1600, // CHECK
 	    1,
 	    1600, // CHECK
 	    0,
