@@ -356,8 +356,8 @@ struct sume_adapter {
 
 	/* MY */
 	struct dma_core		*dma;
-	bus_dma_tag_t		my_tag;
-	bus_dmamap_t		my_map;
+	bus_dma_tag_t		rx_tag;
+	bus_dma_tag_t		tx_tag;
 
 	uint32_t		rx_budget;
 };

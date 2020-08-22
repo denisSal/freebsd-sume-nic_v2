@@ -366,7 +366,7 @@ tryagain:
 	desc = desc_base + nf_priv->tx_ntu;
 	info = nf_priv->tx_desc_info + nf_priv->tx_ntu;
 
-	bus_dmamap_sync(adapter->my_tag, info->map,
+	bus_dmamap_sync(adapter->tx_tag, info->map,
 	    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
 
 	/* Packets large enough do not need to be padded */
@@ -406,7 +406,7 @@ tryagain:
 
 	memcpy(&desc->size, &info->len, 8);
 
-	bus_dmamap_sync(adapter->my_tag, info->map,
+	bus_dmamap_sync(adapter->tx_tag, info->map,
 	    BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
 
 	nf_priv->tx_ntu = RING_NEXT_IDX(nf_priv->tx_ntu);
@@ -444,9 +444,9 @@ sume_uam_tx_clean(struct nf_uam_priv *nf_priv)
 	for (i = 0; i < NUM_DESCRIPTORS; i++) {
 		info = nf_priv->tx_desc_info + i;
 		if (info->buf) {
-			bus_dmamem_free(adapter->my_tag, info->buf, info->map);
-			bus_dmamap_unload(adapter->my_tag, info->map);
-			bus_dmamap_destroy(adapter->my_tag, info->map);
+			bus_dmamem_free(adapter->tx_tag, info->buf, info->map);
+			bus_dmamap_unload(adapter->tx_tag, info->map);
+			bus_dmamap_destroy(adapter->tx_tag, info->map);
 			info->buf = NULL;
 		}
 	}
@@ -473,14 +473,11 @@ sume_uam_rx_clean(struct nf_uam_priv *nf_priv)
 			m = (struct mbuf *) info->buf;
 			m_freem(m);
 			info->buf = 0;
-			bus_dmamap_unload(adapter->my_tag, info->map);
-			bus_dmamap_destroy(adapter->my_tag, info->map);
+			bus_dmamap_unload(adapter->rx_tag, info->map);
+			bus_dmamap_destroy(adapter->rx_tag, info->map);
 			n++;
 		}
 	} while ((nf_priv->rx_ntc = RING_NEXT_IDX(nf_priv->rx_ntc)) != nf_priv->rx_ntu);
-
-	bus_dmamap_unload(adapter->my_tag, adapter->my_map);
-	bus_dmamap_destroy(adapter->my_tag, adapter->my_map);
 
 	printf("End clean n = %d\n", n);
 	return 0;
@@ -504,7 +501,7 @@ sume_uam_tx_alloc(struct nf_uam_priv *nf_priv)
 		desc = desc_base + i;
 		info->rb = i;
 		if (!info->buf) {
-			err = bus_dmamem_alloc(adapter->my_tag, (void **)
+			err = bus_dmamem_alloc(adapter->tx_tag, (void **)
 			    &info->buf, BUS_DMA_WAITOK | BUS_DMA_COHERENT |
 			    BUS_DMA_ZERO, &info->map);
 			if (err) {
@@ -521,7 +518,7 @@ sume_uam_tx_alloc(struct nf_uam_priv *nf_priv)
 				return (ENOMEM);
 			}
 			// DESK
-			err = bus_dmamap_load(adapter->my_tag, info->map, info->buf, len,
+			err = bus_dmamap_load(adapter->tx_tag, info->map, info->buf, len,
 			    callback_dma, &info->paddr, BUS_DMA_NOWAIT);
 			if (err) {
 				sume_uam_tx_clean(nf_priv);
@@ -531,7 +528,7 @@ sume_uam_tx_alloc(struct nf_uam_priv *nf_priv)
 			}
 			memcpy(&desc->address, &info->paddr, 8);
 			desc->generate_irq = 1;
-			bus_dmamap_sync(adapter->my_tag, info->map,
+			bus_dmamap_sync(adapter->tx_tag, info->map,
 			    BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
 		}
 	}
@@ -563,9 +560,9 @@ sume_uam_rx_refill(struct nf_uam_priv *nf_priv)
 		info = nf_priv->rx_desc_info + nf_priv->rx_ntu;
 		info->rb = nf_priv->rx_ntu;
 
-		bus_dmamap_sync(adapter->my_tag, info->map,
+		bus_dmamap_sync(adapter->rx_tag, info->map,
 		    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
-		bus_dmamap_unload(adapter->my_tag, info->map);
+		bus_dmamap_unload(adapter->rx_tag, info->map);
 
 		m = m_getcl(M_WAITOK, MT_DATA, M_PKTHDR);
 		if (m == NULL) {
@@ -579,7 +576,7 @@ sume_uam_rx_refill(struct nf_uam_priv *nf_priv)
 
 		m->m_len = m->m_pkthdr.len = len;
 
-		error = bus_dmamap_load_mbuf_sg(adapter->my_tag, info->map,
+		error = bus_dmamap_load_mbuf_sg(adapter->rx_tag, info->map,
 		    m, segs, &nseg, BUS_DMA_NOWAIT);
 		if (error) {
 			m_freem(m);
@@ -589,12 +586,12 @@ sume_uam_rx_refill(struct nf_uam_priv *nf_priv)
 
 		if (nseg != 1) {
 			m_freem(m);
-			bus_dmamap_unload(adapter->my_tag, info->map);
+			bus_dmamap_unload(adapter->rx_tag, info->map);
 			printf("nseg != 1\n");
 			return (ENOMEM);
 		}
 
-		bus_dmamap_sync(adapter->my_tag, info->map,
+		bus_dmamap_sync(adapter->rx_tag, info->map,
 		    BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
 
 		info->paddr = segs->ds_addr;
@@ -635,14 +632,6 @@ sume_uam_up(struct sume_adapter *adapter, struct ifnet *ifp)
 
 	memset(nf_priv->tx_desc_info, 0, sizeof(nf_priv->tx_desc_info));
 	memset(nf_priv->rx_desc_info, 0, sizeof(nf_priv->rx_desc_info));
-
-	err = bus_dmamap_create(adapter->my_tag, 0,
-            &adapter->my_map);
-        if (err != 0) {
-                device_printf(dev,
-                    "could not create Rx spare DMA map\n");
-                return;
-        }
 
 	err = sume_uam_rx_refill(nf_priv);
 	if (err) {
@@ -1030,13 +1019,32 @@ sume_prepare_dma(struct sume_adapter *adapter)
 	    BUS_SPACE_MAXADDR,
 	    BUS_SPACE_MAXADDR,
 	    NULL, NULL,
+	    1560, // CHECK
+	    1,
+	    1560, // CHECK
+	    0,
+	    NULL,
+	    NULL,
+	    &adapter->tx_tag);
+
+	if (err) {
+		device_printf(dev, "%s: bus_dma_tag_create) "
+		    "failed.\n", __func__);
+		return (err);
+	}
+
+	err = bus_dma_tag_create(bus_get_dma_tag(dev),
+	    PAGE_SIZE, 0,
+	    BUS_SPACE_MAXADDR,
+	    BUS_SPACE_MAXADDR,
+	    NULL, NULL,
 	    1600, // CHECK
 	    1,
 	    1600, // CHECK
 	    0,
 	    NULL,
 	    NULL,
-	    &adapter->my_tag);
+	    &adapter->rx_tag);
 
 	if (err) {
 		device_printf(dev, "%s: bus_dma_tag_create) "
@@ -1159,7 +1167,8 @@ sume_detach(device_t dev)
 
 	pci_release_msi(dev);
 
-	bus_dma_tag_destroy(adapter->my_tag);
+	bus_dma_tag_destroy(adapter->rx_tag);
+	bus_dma_tag_destroy(adapter->tx_tag);
 
 	if (adapter->bar0_addr)
 		bus_release_resource(dev, SYS_RES_MEMORY, adapter->rid0,
